@@ -7,9 +7,18 @@ Video Barcode Signal Extractor is a PyQt5 desktop application for extracting LED
 - Load single videos or ordered video lists.
 - Draw an ROI over the synchronization light source.
 - Extract raw, smoothed, and binary synchronization signals.
+- Load a pre-extracted source signal CSV instead of extracting from video.
 - Load reference CSV, TXT, or TSV traces.
-- Align video time to reference time with cross-correlation, edge pairing, or DTW-assisted workflows.
+- Align video or imported signal time to reference time with cross-correlation, edge pairing, or DTW-assisted workflows.
 - Export aligned signal CSV files and metadata.
+
+## Source Signal CSV Workflow
+
+If the barcode or sync trace was already extracted elsewhere, use
+`File > Open source signal CSV...` or the `Open signal CSV` toolbar button.
+Choose its time and signal columns, then open the reference CSV and run
+auto-align as usual. The imported signal replaces the video ROI trace for
+thresholding, plotting, cross-correlation, edge alignment, DTW, and export.
 
 ## Install From Source
 

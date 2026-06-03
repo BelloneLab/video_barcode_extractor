@@ -82,6 +82,10 @@ class MainWindow(QMainWindow):
         # signal data
         self._sig_t   = None
         self._sig_v   = None
+        self._sig_sample_rate = None
+        self._source_signal_path = None
+        self._source_time_col = None
+        self._source_value_col = None
         self._smooth_cache_key = None
         self._smooth_cache_val = None
         self._csv_df  = None
@@ -190,6 +194,8 @@ class MainWindow(QMainWindow):
         m_file = mb.addMenu('&File')
         add(m_file, 'Open video...', self._open_video, 'Ctrl+O')
         add(m_file, 'Open video list...', self._open_video_list)
+        add(m_file, 'Open source signal CSV...', self._open_source_signal_csv,
+            'Ctrl+Shift+R')
         add(m_file, 'Open reference CSV...', self._open_csv, 'Ctrl+R')
         add(m_file, 'Open CSV list...', self._open_csv_list)
         m_file.addSeparator()
@@ -250,6 +256,7 @@ class MainWindow(QMainWindow):
             ('Left / Right', 'Seek one frame'),
             ('Ctrl+Left / Ctrl+Right', 'Previous / Next item'),
             ('Ctrl+O', 'Open video'),
+            ('Ctrl+Shift+R', 'Open source signal CSV'),
             ('Ctrl+R', 'Open reference CSV'),
             ('Ctrl+E', 'Extract current'),
             ('Ctrl+L', 'Auto-align'),
@@ -358,6 +365,10 @@ class MainWindow(QMainWindow):
             'Video', QStyle.SP_DialogOpenButton,
             'Open one video', self._open_video))
         action_row.addWidget(_panel_btn(
+            'Signal', QStyle.SP_FileIcon,
+            'Open a pre-extracted source signal CSV/TXT file',
+            self._open_source_signal_csv))
+        action_row.addWidget(_panel_btn(
             'List', QStyle.SP_FileDialogListView,
             'Open a list of video files', self._open_video_list))
         action_row.addWidget(_panel_btn(
@@ -426,6 +437,9 @@ class MainWindow(QMainWindow):
         tb.addSeparator()
 
         _btn('Open video', 'Open a video file  (Ctrl+O)', self._open_video)
+        _btn('Open signal CSV',
+             'Open a pre-extracted source signal  (Ctrl+Shift+R)',
+             self._open_source_signal_csv)
         tb.addSeparator()
 
         self._btn_prev = _btn('◀', 'Previous video/reference pair',
@@ -1042,6 +1056,10 @@ class MainWindow(QMainWindow):
             'video_stat': stat,
             'fps': self._fps,
             'n_frames': self._n_frames,
+            'source_signal_path': self._source_signal_path,
+            'source_time_col': self._source_time_col,
+            'source_value_col': self._source_value_col,
+            'signal_sample_rate': self._signal_sample_rate(),
             'roi': roi,
             'channel_index': self._ch_cb.currentIndex(),
             'channel': ch_map.get(self._ch_cb.currentIndex(), 'gray'),
@@ -1080,6 +1098,9 @@ class MainWindow(QMainWindow):
         meta = self._load_cache_metadata(key) or self._current_extraction_metadata(key)
         item.update({
             'roi': meta.get('roi'),
+            'signal_csv': meta.get('source_signal_path') or item.get('signal_csv'),
+            'signal_time_col': meta.get('source_time_col') or item.get('signal_time_col'),
+            'signal_value_col': meta.get('source_value_col') or item.get('signal_value_col'),
             'start_frame': meta.get('start_frame', self._start_spin.value()),
             'end_frame': meta.get('end_frame', self._end_spin.value()),
             'channel_index': meta.get('channel_index', self._ch_cb.currentIndex()),
@@ -1156,6 +1177,10 @@ class MainWindow(QMainWindow):
         roi = self._vid.get_roi()
         item.update({
             'video': self._video_path,
+            'signal_csv': self._source_signal_path,
+            'signal_time_col': self._source_time_col,
+            'signal_value_col': self._source_value_col,
+            'signal_sample_rate': self._signal_sample_rate(),
             'csv': self._csv_path,
             'roi': roi,
             'start_frame': self._start_spin.value(),
@@ -1178,6 +1203,33 @@ class MainWindow(QMainWindow):
             self._default_roi = roi
         self._persist_current_cache_metadata()
 
+    def _apply_item_processing_state(self, item: dict | None):
+        if not item:
+            return
+        self._offset_spin.setValue(float(item.get('offset', 0.0)))
+        method = item.get('align_method')
+        if method:
+            i = self._align_method_cb.findText(method)
+            if i >= 0:
+                self._align_method_cb.setCurrentIndex(i)
+        self._align_model = self._sanitize_align_model(
+            item.get('align_model', self._align_model))
+        if 'max_lag_s' in item:
+            self._max_lag_spin.setValue(
+                float(item.get('max_lag_s', self._max_lag_spin.value())))
+        self._smooth_spin.setValue(
+            int(item.get('smooth_sigma', self._smooth_spin.value())))
+        self._invert_cb.setChecked(
+            bool(item.get('invert', self._invert_cb.isChecked())))
+        self._out_mode_cb.setCurrentIndex(
+            int(item.get('output_mode', self._out_mode_cb.currentIndex())))
+        manual = bool(item.get('threshold_manual', self._rad_manual.isChecked()))
+        self._rad_manual.setChecked(manual)
+        self._rad_auto.setChecked(not manual)
+        self._on_thr_mode_changed()
+        if 'threshold' in item:
+            self._set_threshold(float(item['threshold']))
+
     def _persist_current_cache_metadata(self):
         key = getattr(self, '_sig_cache_key', None)
         if not key or self._sig_t is None or self._sig_v is None or not self._video_path:
@@ -1190,14 +1242,24 @@ class MainWindow(QMainWindow):
 
     def _file_item_text(self, item: dict, index: int):
         video_path = item.get('video') or ''
+        source_path = item.get('signal_csv') or ''
         csv_path = item.get('csv') or ''
-        video_name = Path(video_path).name if video_path else '(no video)'
+        source_name = Path(source_path).name if source_path else ''
+        video_name = Path(video_path).name if video_path else (
+            source_name if source_name else '(no video)')
         csv_name = Path(csv_path).name if csv_path else 'No reference CSV'
-        roi_state = 'ROI set' if item.get('roi') else 'ROI missing'
+        roi_state = 'external signal' if source_path else (
+            'ROI set' if item.get('roi') else 'ROI missing')
         signal_state = 'signal loaded' if index == self._current_item and self._sig_t is not None else 'not loaded'
-        text = f'{index + 1:02d}  {video_name}\n     CSV: {csv_name}  |  {roi_state}  |  {signal_state}'
-        search = ' '.join([video_name, video_path, csv_name, csv_path, roi_state, signal_state]).lower()
-        tooltip = f'Video: {video_path or "None"}\nReference: {csv_path or "None"}\n{roi_state}'
+        source_bit = f'  |  Signal: {source_name}' if source_name and video_path else ''
+        text = f'{index + 1:02d}  {video_name}\n     CSV: {csv_name}{source_bit}  |  {roi_state}  |  {signal_state}'
+        search = ' '.join([
+            video_name, video_path, source_name, source_path,
+            csv_name, csv_path, roi_state, signal_state]).lower()
+        tooltip = (
+            f'Video: {video_path or "None"}\n'
+            f'Source signal: {source_path or "None"}\n'
+            f'Reference: {csv_path or "None"}\n{roi_state}')
         return text, search, tooltip
 
     def _update_current_file_details(self):
@@ -1211,19 +1273,26 @@ class MainWindow(QMainWindow):
             return
 
         video_path = item.get('video') or self._video_path or ''
+        source_path = item.get('signal_csv') or self._source_signal_path or ''
         csv_path = item.get('csv') or self._csv_path or ''
-        video_name = Path(video_path).name if video_path else '(no video)'
+        source_name = Path(source_path).name if source_path else ''
+        video_name = Path(video_path).name if video_path else (
+            source_name if source_name else '(no video)')
         csv_name = Path(csv_path).name if csv_path else 'none'
         self._file_video_lbl.setText(video_name)
-        self._file_video_lbl.setToolTip(video_path)
+        self._file_video_lbl.setToolTip(
+            video_path or f'Source signal: {source_path}')
         self._file_csv_lbl.setText(f'Reference: {csv_name}')
         self._file_csv_lbl.setToolTip(csv_path)
         parts = [
-            'ROI set' if item.get('roi') else 'ROI missing',
+            'external signal' if source_path else (
+                'ROI set' if item.get('roi') else 'ROI missing'),
             'signal loaded' if self._sig_t is not None else 'signal not loaded',
         ]
         if self._csv_df is not None:
             parts.append(f'{len(self._csv_df)} ref rows')
+        if source_path:
+            parts.append(f'{self._signal_sample_rate():.3f} Hz')
         if self._n_frames:
             parts.append(f'{self._n_frames} frames')
         self._file_state_lbl.setText(' | '.join(parts))
@@ -1281,7 +1350,9 @@ class MainWindow(QMainWindow):
         self._btn_next.setEnabled(n > 1 and self._current_item < n - 1)
         labels = []
         for i, item in enumerate(self._items):
-            video = Path(item.get('video') or '').name or '(no video)'
+            source = Path(item.get('signal_csv') or '').name
+            video = Path(item.get('video') or '').name or (
+                source if source else '(no video)')
             csv = Path(item.get('csv') or '').name
             labels.append(f'{i + 1}. {video}' + (f'  |  {csv}' if csv else ''))
         self._file_nav_cb.blockSignals(True)
@@ -1326,7 +1397,10 @@ class MainWindow(QMainWindow):
     def _load_item(self, index: int):
         if not (0 <= index < len(self._items)):
             return
-        if index == self._current_item and self._video_path == self._items[index].get('video'):
+        item = self._items[index]
+        if (index == self._current_item
+                and self._video_path == item.get('video')
+                and self._source_signal_path == item.get('signal_csv')):
             self._try_load_current_signal_from_cache()
             self._update_nav_state()
             return
@@ -1334,8 +1408,17 @@ class MainWindow(QMainWindow):
         self._loading_item = True
         try:
             self._current_item = index
-            item = self._items[index]
-            self._load_video_path(item['video'], apply_item_state=True)
+            if item.get('video'):
+                self._load_video_path(item['video'], apply_item_state=True)
+            else:
+                self._clear_video_state()
+            if item.get('signal_csv'):
+                self._load_source_signal_path(
+                    item['signal_csv'],
+                    time_col=item.get('signal_time_col'),
+                    value_col=item.get('signal_value_col'),
+                    prompt=False,
+                    reset_alignment=False)
             if item.get('csv'):
                 self._load_csv_path(item['csv'])
             else:
@@ -1362,7 +1445,10 @@ class MainWindow(QMainWindow):
             return
         self._last_video_dir = str(Path(paths[0]).parent)
         self._last_dir = self._last_video_dir
-        self._items = [{'video': p, 'csv': None, 'roi': self._default_roi} for p in paths]
+        self._items = [
+            {'video': p, 'signal_csv': None, 'csv': None,
+             'roi': self._default_roi}
+            for p in paths]
         self._current_item = -1
         self._load_item(0)
         self._save_app_settings()
@@ -1376,7 +1462,14 @@ class MainWindow(QMainWindow):
         self._last_csv_dir = str(Path(paths[0]).parent)
         self._last_dir = self._last_csv_dir
         if not self._items:
-            self._items = [{'video': self._video_path, 'csv': None, 'roi': self._default_roi}]
+            self._items = [{
+                'video': self._video_path,
+                'signal_csv': self._source_signal_path,
+                'signal_time_col': self._source_time_col,
+                'signal_value_col': self._source_value_col,
+                'csv': None,
+                'roi': self._default_roi,
+            }]
             self._current_item = 0
         for i, p in enumerate(paths):
             if i < len(self._items):
@@ -1429,7 +1522,9 @@ class MainWindow(QMainWindow):
             return
         self._last_video_dir = str(Path(path).parent)
         self._last_dir = self._last_video_dir
-        self._items = [{'video': path, 'csv': None, 'roi': self._default_roi}]
+        self._items = [{
+            'video': path, 'signal_csv': None, 'csv': None,
+            'roi': self._default_roi}]
         self._current_item = 0
         self._loading_item = True
         try:
@@ -1445,6 +1540,41 @@ class MainWindow(QMainWindow):
         self._update_nav_state()
         self._save_app_settings()
 
+    def _clear_video_state(self):
+        if self._cap:
+            self._cap.release()
+        self._cap = None
+        self._video_path = None
+        self._cache = FrameCache(120)
+        self._n_frames = 0
+        self._sig_t = None
+        self._sig_v = None
+        self._sig_sample_rate = None
+        self._source_signal_path = None
+        self._source_time_col = None
+        self._source_value_col = None
+        self._invalidate_smooth_cache()
+        self._sig_cache_key = None
+        self._last_loaded_signal_key = None
+        self._fslider.blockSignals(True)
+        self._fslider.setMaximum(0)
+        self._fslider.setValue(0)
+        self._fslider.blockSignals(False)
+        self._fspin.blockSignals(True)
+        self._fspin.setMaximum(0)
+        self._fspin.setValue(0)
+        self._fspin.blockSignals(False)
+        self._start_spin.setMaximum(0)
+        self._start_spin.setValue(0)
+        self._end_spin.setMaximum(0)
+        self._end_spin.setValue(0)
+        self._ftotal_lbl.setText('0')
+        self._time_lbl.setText('00:00.000 / 00:00.000')
+        self._btn_extract.setEnabled(False)
+        self._btn_play.setChecked(False)
+        self._toggle_play(False)
+        self.setWindowTitle('Video Barcode Signal Extractor')
+
     def _load_video_path(self, path: str, apply_item_state: bool = True):
         self._last_video_dir = str(Path(path).parent)
         self._last_dir = self._last_video_dir
@@ -1458,6 +1588,10 @@ class MainWindow(QMainWindow):
         self._cache = FrameCache(120)
         self._sig_t = None
         self._sig_v = None
+        self._sig_sample_rate = None
+        self._source_signal_path = None
+        self._source_time_col = None
+        self._source_value_col = None
         self._invalidate_smooth_cache()
         self._sig_cache_key = None
         self._last_loaded_signal_key = None
@@ -1833,6 +1967,10 @@ class MainWindow(QMainWindow):
         fps_eff = len(values) / elapsed if elapsed > 0 else 0
         self._sig_t = times
         self._sig_v = values
+        self._sig_sample_rate = self._fps
+        self._source_signal_path = None
+        self._source_time_col = None
+        self._source_value_col = None
         self._invalidate_smooth_cache()
         self._hide_progress_complex()
         self._btn_extract.setEnabled(True)
@@ -2059,6 +2197,26 @@ class MainWindow(QMainWindow):
         return sig, output
 
     @staticmethod
+    def _estimate_signal_sample_rate(times) -> float | None:
+        t = np.asarray(times, dtype=np.float64).reshape(-1)
+        t = t[np.isfinite(t)]
+        if t.size < 2:
+            return None
+        dt = np.diff(np.sort(t))
+        dt = dt[np.isfinite(dt) & (dt > 0)]
+        if dt.size == 0:
+            return None
+        return float(1.0 / np.median(dt))
+
+    def _signal_sample_rate(self) -> float:
+        rate = self._sig_sample_rate
+        if rate is None or not np.isfinite(rate) or rate <= 0:
+            rate = self._fps
+        if rate is None or not np.isfinite(rate) or rate <= 0:
+            rate = 30.0
+        return float(rate)
+
+    @staticmethod
     def _norm01(x):
         return norm01(x)
 
@@ -2080,7 +2238,7 @@ class MainWindow(QMainWindow):
         self._persist_current_cache_metadata()
 
     def _offset_direction_text(self, offset: float) -> str:
-        if abs(offset) < 0.5 / max(self._fps, 1e-9):
+        if abs(offset) < 0.5 / max(self._signal_sample_rate(), 1e-9):
             return 'in phase'
         if offset > 0:
             return f'video behind reference by {offset:.4f} s'
@@ -2091,13 +2249,13 @@ class MainWindow(QMainWindow):
 
     def _pair_edges(self, video_edges, video_dirs, ref_edges, ref_dirs, offset):
         return pair_edges(video_edges, video_dirs, ref_edges, ref_dirs,
-                          offset, self._fps)
+                          offset, self._signal_sample_rate())
 
     def _estimate_xcorr_offset(self, t_csv, v_csv, output):
         max_lag = float(self._max_lag_spin.value()) if hasattr(self, '_max_lag_spin') else 2.5
         return estimate_xcorr_offset(
             self._sig_t, output, t_csv, v_csv,
-            max_lag_s=max_lag, fps=self._fps,
+            max_lag_s=max_lag, fps=self._signal_sample_rate(),
             view_range=self._view_range())
 
     def _reset_diagnostic_plot(self):
@@ -2190,7 +2348,7 @@ class MainWindow(QMainWindow):
 
     def _alignment_metrics(self, output_norm, aligned_t, t_csv, v_csv, x_range=None):
         return alignment_metrics(output_norm, aligned_t, t_csv, v_csv,
-                                 fps=self._fps, x_range=x_range)
+                                 fps=self._signal_sample_rate(), x_range=x_range)
 
     def _refresh_view(self):
         sig, output = self._get_processed_signal()
@@ -2332,6 +2490,185 @@ class MainWindow(QMainWindow):
     def _load_csv_robust(path: str) -> pd.DataFrame:
         return load_csv_robust(path)
 
+    @staticmethod
+    def _guess_time_column(cols):
+        for c in cols:
+            name = str(c).lower()
+            if any(k in name for k in [
+                    'time', 'sec', 'second', 'timestamp', 't_', 'ms']):
+                return c
+        return cols[0] if cols else None
+
+    @staticmethod
+    def _guess_signal_column(cols, time_col=None):
+        preferred = [
+            'raw', 'signal', 'sync', 'barcode', 'ttl', 'dio', 'trigger',
+            'led', 'pulse', 'value', 'y']
+        for c in cols:
+            if c == time_col:
+                continue
+            name = str(c).lower()
+            if any(k in name for k in preferred):
+                return c
+        for c in cols:
+            if c != time_col:
+                return c
+        return cols[0] if cols else None
+
+    def _choose_source_signal_columns(self, df: pd.DataFrame, path: str,
+                                      time_col=None, value_col=None):
+        cols = list(df.columns)
+        if not cols:
+            return None
+        default_t = time_col if time_col in cols else self._guess_time_column(cols)
+        default_v = value_col if value_col in cols else self._guess_signal_column(cols, default_t)
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle('Source signal columns')
+        layout = QVBoxLayout(dlg)
+        hint = QLabel(
+            f'Choose columns for the pre-extracted signal in {Path(path).name}.')
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
+
+        form = QFormLayout()
+        time_cb = QComboBox()
+        value_cb = QComboBox()
+        for c in cols:
+            time_cb.addItem(str(c), c)
+            value_cb.addItem(str(c), c)
+        if default_t in cols:
+            time_cb.setCurrentIndex(cols.index(default_t))
+        if default_v in cols:
+            value_cb.setCurrentIndex(cols.index(default_v))
+        form.addRow('Time column:', time_cb)
+        form.addRow('Signal column:', value_cb)
+        layout.addLayout(form)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(dlg.accept)
+        buttons.rejected.connect(dlg.reject)
+        layout.addWidget(buttons)
+        if dlg.exec_() != QDialog.Accepted:
+            return None
+        return time_cb.currentData(), value_cb.currentData()
+
+    def _coerce_source_signal_columns(self, df: pd.DataFrame, time_col,
+                                      value_col):
+        cols = list(df.columns)
+        if time_col not in cols:
+            time_col = self._guess_time_column(cols)
+        if value_col not in cols:
+            value_col = self._guess_signal_column(cols, time_col)
+        if time_col is None or value_col is None:
+            raise ValueError('A source signal CSV needs time and signal columns.')
+        if time_col == value_col:
+            raise ValueError('Choose different time and signal columns.')
+
+        t = pd.to_numeric(df[time_col], errors='coerce').to_numpy(dtype=np.float64)
+        v = pd.to_numeric(df[value_col], errors='coerce').to_numpy(dtype=np.float64)
+        valid = np.isfinite(t) & np.isfinite(v)
+        if np.count_nonzero(valid) < 2:
+            raise ValueError(
+                'The selected source signal columns have fewer than 2 numeric rows.')
+        t = t[valid]
+        v = v[valid]
+        order = np.argsort(t)
+        t = t[order]
+        v = v[order]
+        keep = np.concatenate(([True], np.diff(t) > 0))
+        t = t[keep]
+        v = v[keep]
+        if len(t) < 2:
+            raise ValueError(
+                'The source signal time column must contain at least 2 unique times.')
+        return t, v.astype(np.float32), time_col, value_col
+
+    def _open_source_signal_csv(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, 'Open source signal CSV', self._last_csv_dir,
+            'CSV / TXT (*.csv *.txt *.tsv);;All (*)')
+        if not path:
+            return
+        self._load_source_signal_path(path, prompt=True)
+        self._save_app_settings()
+
+    def _load_source_signal_path(self, path: str, time_col=None, value_col=None,
+                                 prompt: bool = True,
+                                 reset_alignment: bool = True):
+        self._last_csv_dir = str(Path(path).parent)
+        self._last_dir = self._last_csv_dir
+        try:
+            df = self._load_csv_robust(path)
+            if prompt:
+                selected = self._choose_source_signal_columns(
+                    df, path, time_col=time_col, value_col=value_col)
+                if selected is None:
+                    return
+                time_col, value_col = selected
+            times, values, time_col, value_col = self._coerce_source_signal_columns(
+                df, time_col, value_col)
+        except Exception as e:
+            QMessageBox.critical(self, 'Source Signal CSV Error', str(e))
+            return
+
+        self._sig_t = times
+        self._sig_v = values
+        self._sig_sample_rate = self._estimate_signal_sample_rate(times)
+        self._source_signal_path = path
+        self._source_time_col = time_col
+        self._source_value_col = value_col
+        self._sig_cache_key = None
+        self._last_loaded_signal_key = None
+        self._invalidate_smooth_cache()
+        if reset_alignment:
+            self._align_model = self._default_align_model()
+            self._offset_spin.setValue(0.0)
+        else:
+            self._apply_item_processing_state(self._current_project_item())
+
+        if self._current_item < 0:
+            self._items = [{
+                'video': self._video_path,
+                'signal_csv': path,
+                'signal_time_col': time_col,
+                'signal_value_col': value_col,
+                'csv': self._csv_path,
+                'roi': self._default_roi,
+            }]
+            self._current_item = 0
+        item = self._current_project_item()
+        if item is not None:
+            item.update({
+                'signal_csv': path,
+                'signal_time_col': time_col,
+                'signal_value_col': value_col,
+                'signal_sample_rate': self._signal_sample_rate(),
+            })
+
+        if hasattr(self, '_workers_info'):
+            self._workers_info.setText('(imported CSV)')
+        if len(times) > 1:
+            self._region.setRegion([times[0], times[-1]])
+            self._trace_pw.setXRange(
+                float(times[0]), float(min(times[0] + 30.0, times[-1])),
+                padding=0)
+        self._raw_curve.setData(self._sig_t, self._sig_v)
+        if self._rad_auto.isChecked():
+            self._apply_auto_threshold()
+        else:
+            self._refresh_view()
+        self._update_quality_readout()
+        if self._csv_df is not None:
+            self._btn_xcorr.setEnabled(True)
+        self._right_tabs.setCurrentIndex(1)
+        self._update_nav_state()
+        rate = self._signal_sample_rate()
+        self._set_status(
+            f'Source signal CSV: {Path(path).name}  |  {len(times)} samples  '
+            f'|  time={time_col}  signal={value_col}  |  {rate:.3f} Hz')
+
     def _open_csv(self):
         path, _ = QFileDialog.getOpenFileName(
             self, 'Open CSV trace', self._last_csv_dir,
@@ -2456,7 +2793,7 @@ class MainWindow(QMainWindow):
         # ran xcorr to set the residual offset spinbox to a sensible value.
         if method == 'dtw':
             dtw = dtw_alignment(self._sig_t, output, t_csv, v_csv,
-                                fps=self._fps,
+                                fps=self._signal_sample_rate(),
                                 max_warp_s=float(self._max_lag_spin.value())
                                             if hasattr(self, '_max_lag_spin') else 2.0)
             if dtw is None:
@@ -2526,7 +2863,8 @@ class MainWindow(QMainWindow):
 
     # ── export ────────────────────────────────────────────────────────────────
     def _default_export_path(self, video_path: str | None = None, out_dir: str | None = None) -> str:
-        base = Path(video_path or self._video_path or 'signal').stem
+        base = Path(video_path or self._source_signal_path
+                    or self._video_path or 'signal').stem
         folder = Path(out_dir or self._last_export_dir)
         return str(folder / f'{base}_aligned_time.csv')
 
@@ -2547,12 +2885,16 @@ class MainWindow(QMainWindow):
         df = pd.DataFrame({
             'aligned_time': aligned_time,
             'time_s':  times,
-            'frame':   np.rint(times * self._fps).astype(np.int32),
+            'frame':   np.rint(times * self._signal_sample_rate()).astype(np.int32),
+            'sample_index': np.arange(len(times), dtype=np.int32),
             'raw':     raw,
             'smoothed': sig,
             'binary':  binary,
             'offset_s': offset,
             'alignment_method': self._align_method_cb.currentText(),
+            'source_signal_csv': self._source_signal_path or '',
+            'source_time_col': self._source_time_col or '',
+            'source_value_col': self._source_value_col or '',
         })
         if self._csv_df is not None:
             try:
@@ -2592,7 +2934,7 @@ class MainWindow(QMainWindow):
     def _export_signal(self):
         if self._sig_t is None:
             QMessageBox.warning(self, 'No data',
-                                'Extract a signal first.')
+                                'Extract or load a source signal first.')
             return
         self._save_current_item_state()
         default_export = self._default_export_path()
@@ -2628,6 +2970,10 @@ class MainWindow(QMainWindow):
         v_col = 'raw' if 'raw' in df.columns else ('binary' if 'binary' in df.columns else df.columns[min(1, len(df.columns) - 1)])
         self._sig_t = df[t_col].to_numpy(dtype=np.float64)
         self._sig_v = df[v_col].to_numpy(dtype=np.float32)
+        self._sig_sample_rate = self._estimate_signal_sample_rate(self._sig_t)
+        self._source_signal_path = path
+        self._source_time_col = t_col
+        self._source_value_col = v_col
         self._invalidate_smooth_cache()
         if has_embedded_ref:
             self._offset_spin.setValue(0.0)
@@ -2666,6 +3012,8 @@ class MainWindow(QMainWindow):
             self._csv_align_cb.setCurrentText(
                 'reference_align_signal' if 'reference_align_signal' in ref_df.columns else 'reference_signal')
             self._btn_xcorr.setEnabled(True)
+        elif self._csv_df is not None:
+            self._btn_xcorr.setEnabled(True)
         self._raw_curve.setData(self._sig_t, self._sig_v)
         if len(self._sig_t) > 1:
             self._region.setRegion([self._sig_t[0], self._sig_t[-1]])
@@ -2702,6 +3050,10 @@ class MainWindow(QMainWindow):
                 skipped.append((Path(item['video']).name, 'not extracted/cached'))
                 continue
             self._sig_t, self._sig_v = cached
+            self._sig_sample_rate = self._fps
+            self._source_signal_path = None
+            self._source_time_col = None
+            self._source_value_col = None
             self._invalidate_smooth_cache()
             if item.get('csv'):
                 self._load_csv_path(item['csv'])
@@ -2844,7 +3196,8 @@ class MainWindow(QMainWindow):
         if videos:
             self._last_video_dir = str(Path(videos[0]).parent)
             self._last_dir = self._last_video_dir
-            self._items = [{'video': v, 'csv': None, 'roi': self._default_roi}
+            self._items = [{'video': v, 'signal_csv': None, 'csv': None,
+                            'roi': self._default_roi}
                            for v in videos]
             self._current_item = -1
             self._load_item(0)
@@ -2855,6 +3208,9 @@ class MainWindow(QMainWindow):
             self._last_dir = self._last_csv_dir
             if not self._items:
                 self._items = [{'video': None, 'csv': None,
+                                'signal_csv': self._source_signal_path,
+                                'signal_time_col': self._source_time_col,
+                                'signal_value_col': self._source_value_col,
                                 'roi': self._default_roi}]
                 self._current_item = 0
             if len(csvs) == 1:
